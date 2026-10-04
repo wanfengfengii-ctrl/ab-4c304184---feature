@@ -1,0 +1,37 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: concatemer-decode:latest
+    container_name: concatemer-api
+    ports:
+      # Host-side port is configurable via HOST_PORT (default 8000).
+      - "${HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot verification: waits until the API is healthy, then runs the
+  # code tests, build sanity checks and a live decode smoke test (with
+  # insertions, deletions and substitutions). Reports via its exit code:
+  #   docker compose run --rm verify ; echo $?
+  verify:
+    image: concatemer-decode:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: concatemer-verify
+    depends_on:
+      api:
+        condition: service_healthy
+    entrypoint: ["python", "scripts/verify.py"]
+    restart: "no"

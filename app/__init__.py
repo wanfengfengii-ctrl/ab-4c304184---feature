@@ -1,0 +1,1 @@
+"""Concatemer decode service."""
