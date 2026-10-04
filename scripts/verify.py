@@ -8,7 +8,11 @@ It performs, in order, exiting non-zero on the first failure:
 3. sanity-check the running build (importable app + dependency versions),
 4. run a decode smoke test against the live API that exercises
    insertions, deletions and substitutions together, plus unique,
-   ambiguous and infeasible responses.
+   ambiguous and infeasible responses;
+5. repeat the decode smoke for terminal_mode=partial (proper suffix /
+   prefix terminals with indel+substitution noise, locatable budget
+   failure, and framing failure), and assert the legacy default keeps
+   full-copy behaviour.
 """
 
 from __future__ import annotations
@@ -186,6 +190,140 @@ def smoke_decode() -> bool:
         print("FAIL: infeasible case not locatable", data.get("nearest"))
         return False
     print("infeasible case passed (violating segment located)")
+    return smoke_decode_partial()
+
+
+def smoke_decode_partial() -> bool:
+    """Live checks for terminal_mode=partial (truncated acquisition window)."""
+    step("partial-terminal smoke against live API")
+
+    # 20 nt reference; one-base terminal framing makes the cut point unique.
+    ref = "ACGTACGATCGTACGATCAT"
+    assert len(ref) == 20
+    read = ref[19:] + ref + ref + ref[:1]  # 1 + 20 + 20 + 1 = 42 nt
+    status, data = post(
+        {
+            "reference": ref,
+            "read": read,
+            "copies": 4,
+            "max_edits": 0,
+            "terminal_mode": "partial",
+        }
+    )
+    print("partial clean status:", status)
+    if status != 200 or data.get("status") != "unique":
+        print("FAIL: partial clean case", status, data.get("status"))
+        return False
+    witness = data["witness"]
+    if witness["terminal_ranges"] != {"first": [19, 20], "last": [0, 1]}:
+        print(
+            "FAIL: unexpected terminal ranges", witness["terminal_ranges"]
+        )
+        return False
+    if witness["boundaries"] != [[0, 1], [1, 21], [21, 41], [41, 42]]:
+        print("FAIL: unexpected boundaries", witness["boundaries"])
+        return False
+    # Replayable CIGARs must reconstruct each piece and its reference range.
+    for seg in witness["segments"]:
+        if seg["aligned_reference"].replace("-", "") != seg["reference"]:
+            print("FAIL: terminal reference replay mismatch")
+            return False
+        if seg["aligned_read"].replace("-", "") != seg["read"]:
+            print("FAIL: terminal read replay mismatch")
+            return False
+    print("partial clean case passed (proper suffix/prefix framing)")
+
+    # Truncated ends carrying substitution + deletion + insertion.
+    clean = ref[14:] + ref + ref[:8]  # 6 + 20 + 8 = 34 nt
+    head, mid, tail = clean[:6], clean[6:26], clean[26:]
+    head = "T" + head[1:]            # substitution in the suffix head
+    mid = mid[:10] + mid[11:]        # deletion in the middle copy
+    tail = tail[:4] + "G" + tail[4:]  # insertion in the prefix tail
+    status, data = post(
+        {
+            "reference": ref,
+            "read": head + mid + tail,
+            "copies": 3,
+            "max_edits": 1,
+            "terminal_mode": "partial",
+        }
+    )
+    if status != 200:
+        print("FAIL: partial mixed-noise case", status)
+        return False
+    if data["objective"] != {"total_edits": 3, "max_segment_edits": 1}:
+        print("FAIL: partial mixed-noise objective", data["objective"])
+        return False
+    witness = data.get("witness") or data["witnesses"][0]
+    ops = {
+        op for seg in witness["segments"] for op in seg["cigar"] if op.isalpha()
+    }
+    if not {"M", "D", "I"} <= ops:
+        print("FAIL: partial CIGAR must contain M, D and I; got", ops)
+        return False
+    print(
+        "partial mixed-noise case passed (substitution + deletion + "
+        "insertion at truncated ends)"
+    )
+
+    # Budget failure must remain locatable (noise overflow, not truncation).
+    status, data = post(
+        {
+            "reference": ref,
+            "read": ref + ref[:19],  # 39 nt forces a 20-nt terminal piece
+            "copies": 2,
+            "max_edits": 0,
+            "terminal_mode": "partial",
+        }
+    )
+    if status != 422 or data.get("constraint", {}).get("name") != (
+        "per_segment_edit_budget"
+    ):
+        print("FAIL: partial budget-failure case", status)
+        return False
+    bad = data["nearest"]["violating_segments"]
+    if not bad or bad[0].get("required_edits") != 1:
+        print("FAIL: partial budget failure not locatable")
+        return False
+    print("partial budget failure passed (located, distinguishable from noise)")
+
+    # Framing impossibility: the window cannot form legal prefix/suffix.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": "A" * 119,
+            "copies": 3,
+            "max_edits": 3,
+            "terminal_mode": "partial",
+        }
+    )
+    if status != 422 or data.get("constraint", {}).get("name") != (
+        "terminal_prefix_suffix"
+    ):
+        print("FAIL: partial structural-failure case", status)
+        return False
+    print(
+        "partial structural failure passed "
+        "(terminal_prefix_suffix, distinct from budget overflow)"
+    )
+
+    # Legacy regression: omitting terminal_mode must behave exactly as full.
+    status, data = post(
+        {
+            "reference": ref,
+            "read": ref * 3,
+            "copies": 3,
+            "max_edits": 0,
+        }
+    )
+    if (
+        status != 200
+        or data.get("request", {}).get("terminal_mode") != "full"
+        or "terminal_ranges" in data.get("witness", {})
+    ):
+        print("FAIL: default terminal_mode regression", status)
+        return False
+    print("legacy default regression passed (terminal_mode defaults to full)")
     return True
 
 
